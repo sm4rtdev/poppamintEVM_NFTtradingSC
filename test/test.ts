@@ -1,95 +1,190 @@
-import { ethers } from "hardhat";
+// test/Rematic.proxy.js
+// Load dependencies
 import { expect } from "chai";
-import { ContractFactory, Signer } from "ethers";
+import { Contract } from "ethers";
+import hre, { ethers } from "hardhat";
+import CloneFactoryABI from "../build/contracts/contracts/Factory.sol/MarketFactory.json";
 
-describe("NFTMintFactory and NFTTrade", function () {
-  let NFTMintFactory: ContractFactory;
-  let NFTTrade: ContractFactory;
-  let nftMintFactory: NFTMintFactory;
-  let nftTrade: NFTTrade;
-  let owner: Signer;
-  let addr1: Signer;
-  let addr2: Signer;
-  let unlockTime: number;
+let MainContract;
+let main;
 
-  beforeEach(async function () {
-    [owner, addr1, addr2] = await ethers.getSigners();
+let marketFactoryContract;
+let MarketFactory;
 
-    // Get the current block timestamp and set unlock time to 1 hour from now
-    unlockTime = (await ethers.provider.getBlock("latest")).timestamp + 3600;
+let testTokenContract;
+let testTokenFactory;
+let owner;
+let user1;
+let user2;
+let user3;
+let treasury;
 
-    // Deploy the NFTMintFactory contract
-    NFTMintFactory = await ethers.getContractFactory("NFTMintFactory");
-    nftMintFactory = (await NFTMintFactory.deploy(
-      "NFTMintFactory",
-      "NFTMF",
-      unlockTime,
-      { value: ethers.utils.parseEther("1.0") }
-    )) as NFTMintFactory;
-    await nftMintFactory.deployed();
+// Start test block
+describe("AI NFT marketplace", function () {
+  before(async function () {
+    [owner, user1, user2, user3, treasury] = await ethers.getSigners();
 
-    // Deploy the NFTTrade contract
-    NFTTrade = await ethers.getContractFactory("NFTTrade");
-    nftTrade = (await NFTTrade.deploy(nftMintFactory.address)) as NFTTrade;
-    await nftTrade.deployed();
+    MarketFactory = await ethers.getContractFactory("MarketFactory");
+    marketFactoryContract = await MarketFactory.deploy();
+
+    testTokenFactory = await ethers.getContractFactory("TestERC20");
+    testTokenContract = await testTokenFactory.deploy();
+
+    main = await ethers.getContractFactory("Main");
+    MainContract = await main.deploy(testTokenContract.address);
+
+    await testTokenContract.transfer(user1.address, utils.parseEther("10000"));
+    await testTokenContract.transfer(user2.address, utils.parseEther("10000"));
+    await testTokenContract.transfer(user3.address, utils.parseEther("10000"));
+
+    await MainContract.setMarketFactory(marketFactoryContract.address);
+    await MainContract.setTreasury(treasury.address);
   });
 
-  it("Should deploy NFTMintFactory and NFTTrade with correct parameters", async function () {
-    expect(await nftMintFactory.unlockTime()).to.equal(unlockTime);
-    expect(await nftMintFactory.owner()).to.equal(await owner.getAddress());
-  });
+  // Test case
+  it("Basic Token Contract works correctly.", async function () {
+    let tx = await MainContract.creatCollection("collection data");
+    let { events } = await tx.wait();
+    const collectionId = events[0].args.collectionId;
+    const factory = new Contract(collectionId, CloneFactoryABI.abi, owner);
+    await MainContract.mint(collectionId, "test1", 50);
+    await factory.approve(MainContract.address, 1);
 
-  it("Should mint an NFT", async function () {
-    const tokenURI = "https://example.com/nft";
-    await expect(nftMintFactory.mintNFT(await addr1.getAddress(), tokenURI))
-      .to.emit(nftMintFactory, "NFTMinted")
-      .withArgs(await addr1.getAddress(), 1, tokenURI);
-
-    expect(await nftMintFactory.tokenCounter()).to.equal(1);
-    expect(await nftMintFactory.ownerOf(1)).to.equal(await addr1.getAddress());
-    expect(await nftMintFactory.tokenURI(1)).to.equal(tokenURI);
-  });
-
-  it("Should list an NFT for sale and buy it", async function () {
-    const tokenURI = "https://example.com/nft";
-    await nftMintFactory.mintNFT(await addr1.getAddress(), tokenURI);
-    await nftMintFactory.connect(addr1).approve(nftTrade.address, 1);
-
-    const price = ethers.utils.parseEther("1.0");
-    await expect(nftTrade.connect(addr1).listNFT(1, price))
-      .to.emit(nftTrade, "NFTListed")
-      .withArgs(1, price, await addr1.getAddress());
-
-    await expect(nftTrade.connect(addr2).buyNFT(1, { value: price }))
-      .to.emit(nftTrade, "NFTBought")
-      .withArgs(1, price, await addr2.getAddress(), await addr1.getAddress());
-
-    expect(await nftMintFactory.ownerOf(1)).to.equal(await addr2.getAddress());
-  });
-
-  it("Should allow withdrawal after unlock time", async function () {
-    await ethers.provider.send("evm_increaseTime", [3600]);
-    await ethers.provider.send("evm_mine", []);
-
-    const initialBalance = await ethers.provider.getBalance(
-      await owner.getAddress()
+    tx = await MainContract.putOnSale(
+      collectionId,
+      1,
+      ethers.utils.parseEther("100")
     );
-    await expect(nftMintFactory.withdraw())
-      .to.emit(nftMintFactory, "Withdrawal")
-      .withArgs(ethers.utils.parseEther("1.0"), anyValue);
+    let log = await tx.wait();
+    const key = log.events[log.events.length - 1].args._key;
+    console.log(key);
 
-    const finalBalance = await ethers.provider.getBalance(
-      await owner.getAddress()
+    await expect(
+      MainContract.auction(key, ethers.utils.parseEther("10"))
+    ).revertedWith("Main:IV user");
+    await expect(MainContract.connect(user1).auction(key, 0)).revertedWith(
+      "Main:IV price"
     );
-    expect(finalBalance.sub(initialBalance)).to.be.closeTo(
-      ethers.utils.parseEther("1.0"),
-      ethers.utils.parseEther("0.01")
-    ); // account for gas fees
-  });
+    await expect(
+      MainContract.connect(user1).auction(
+        key.replace("1", "2"),
+        ethers.utils.parseEther("10")
+      )
+    ).revertedWith("Main:IV hash id");
+    const beforeBalance = await testTokenContract.balanceOf(user1.address);
+    await testTokenContract
+      .connect(user1)
+      .approve(MainContract.address, utils.parseEther("10"));
+    await MainContract.connect(user1).auction(
+      key,
+      ethers.utils.parseEther("10")
+    );
+    expect(utils.parseEther("10")).to.eq(
+      beforeBalance
+        .sub(await testTokenContract.balanceOf(user1.address))
+        .toString()
+    );
 
-  it("Should not allow withdrawal before unlock time", async function () {
-    await expect(nftMintFactory.withdraw()).to.be.revertedWith(
-      "You can't withdraw yet"
+    await MainContract.connect(user1).auction(
+      key,
+      ethers.utils.parseEther("5")
     );
+    expect(utils.parseEther("5")).to.eq(
+      beforeBalance
+        .sub(await testTokenContract.balanceOf(user1.address))
+        .toString()
+    );
+    await testTokenContract
+      .connect(user2)
+      .approve(MainContract.address, utils.parseEther("20"));
+    await MainContract.connect(user2).auction(
+      key,
+      ethers.utils.parseEther("20")
+    );
+
+    // console.log("====PutonSale info:", await MainContract.ListInfo(key))
+
+    await testTokenContract
+      .connect(user3)
+      .approve(MainContract.address, utils.parseEther("100"));
+    await MainContract.connect(user3).buyNow(key);
+
+    expect(await factory.ownerOf("1")).to.eq(user3.address);
+    expect((await testTokenContract.balanceOf(user3.address)).toString()).to.eq(
+      utils.parseEther("9900")
+    );
+    // console.log("====after buynow PutonSale info:", await MainContract.ListInfo(key))
+
+    expect((await testTokenContract.balanceOf(user3.address)).toString()).to.eq(
+      utils.parseEther("9900")
+    );
+    expect((await testTokenContract.balanceOf(owner.address)).toString()).to.eq(
+      utils.parseEther("9999970050")
+    );
+
+    await MainContract.connect(user1).cancelAuction(key);
+    expect((await testTokenContract.balanceOf(user1.address)).toString()).to.eq(
+      utils.parseEther("10000")
+    );
+    // console.log("====after cancel auction PutonSale info:", await MainContract.ListInfo(key))
+
+    await factory.connect(user3).approve(MainContract.address, 1);
+    let tx2 = await MainContract.connect(user3).putOnSale(
+      collectionId,
+      "1",
+      utils.parseEther("500")
+    );
+    log = await tx2.wait();
+    const key2 = log.events[log.events.length - 1].args._key;
+    await testTokenContract.approve(
+      MainContract.address,
+      utils.parseEther("200")
+    );
+    await testTokenContract
+      .connect(user1)
+      .approve(MainContract.address, utils.parseEther("200"));
+    await MainContract.auction(key2, utils.parseEther("200"));
+    await MainContract.connect(user1).auction(key2, utils.parseEther("100"));
+    await MainContract.connect(user3).makeOffer(key2, owner.address);
+
+    await factory.approve(MainContract.address, 1);
+    await MainContract.putOnSale(
+      collectionId,
+      1,
+      ethers.utils.parseEther("100")
+    );
+
+    // console.log("====after cancel auction PutonSale info:", await MainContract.ListInfo(key))
+    await MainContract.makeOffer(key, user2.address);
+    expect(await factory.ownerOf("1")).to.eq(user2.address);
+
+    await factory.connect(user2).approve(MainContract.address, 1);
+    let tx3 = await MainContract.connect(user2).putOnSale(
+      collectionId,
+      "1",
+      utils.parseEther("500")
+    );
+    log = await tx3.wait();
+    const key3 = log.events[log.events.length - 1].args._key;
+
+    await testTokenContract
+      .connect(user1)
+      .approve(MainContract.address, utils.parseEther("10"));
+    await MainContract.connect(user1).auction(
+      key3,
+      ethers.utils.parseEther("10")
+    );
+
+    await MainContract.connect(user2).cancelList(key3);
+    await expect(MainContract.makeOffer(key3, user2.address)).revertedWith(
+      "Main:not maker"
+    );
+
+    await testTokenContract
+      .connect(user3)
+      .approve(MainContract.address, utils.parseEther("20"));
+    await expect(
+      MainContract.connect(user3).auction(key3, ethers.utils.parseEther("20"))
+    ).revertedWith("Main:IV hash id");
   });
 });
